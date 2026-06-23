@@ -58,6 +58,7 @@ M_DELTA  = 1232.0    # Delta+(1232) PDG value
 # MIMOSA positions: RECOdata x/y are in cm  (±1.06 cm = ±10.6 mm = MIMOSA26 active area)
 # Chamber positions: RECOdata is in mm      (±23 mm = Micromegas active strip range)
 Z_MIMOSA = np.array([35.0, 38.6, 41.4, 48.5, 51.5, 53.65])  # cm, planes 0–5
+MIMOSA_X_OFFSET = np.array([0.0, 0.00372, -0.002625, -0.01239, -0.009682, -0.005116])  # measured residuals relative to M0 [cm], x only
 Z_CMS    = 36.9    # cm
 Z_TARGET = 44.95   # cm  (midpoint of Mimosa2–Mimosa3 gap; actual not measured)
 Z_MAG_CTR = 211.5  # cm  (bending magnet centre)
@@ -279,7 +280,7 @@ def interaction_mask(reco):
 # Track reconstruction from MIMOSA telescope
 # ════════════════════════════════════════════════════════════════════════════════
 
-def _single_hit_position(reco, plane, axis):
+def _single_hit_position(reco, plane, axis, x_align=None, y_align=None):
     """
     Return per-event first cluster position (cm) for a given MIMOSA plane and
     axis ('x' or 'y').  Events with no hit give NaN; events with >1 cluster
@@ -291,10 +292,16 @@ def _single_hit_position(reco, plane, axis):
     single = n == 1
     if single.any():
         result[single] = ak.to_numpy(ak.flatten(pos[single]))
+    if axis == "x":
+        result += MIMOSA_X_OFFSET[plane]
+        if x_align is not None:
+            result -= x_align[plane]
+    if axis == "y" and y_align is not None:
+        result -= y_align[plane]
     return result
 
 
-def fit_track_segment(reco, planes, axis):
+def fit_track_segment(reco, planes, axis, x_align=None, y_align=None):
     """
     Least-squares straight-line fit through the given MIMOSA planes.
 
@@ -308,7 +315,7 @@ def fit_track_segment(reco, planes, axis):
     """
     z_vals = Z_MIMOSA[planes]                          # z positions for these planes [cm]
     x_per_plane = np.column_stack(                     # shape (n_events, n_planes)
-        [_single_hit_position(reco, p, axis) for p in planes]
+        [_single_hit_position(reco, p, axis, x_align, y_align) for p in planes]
     )
     # Require all planes to have exactly one hit
     clean = np.all(np.isfinite(x_per_plane), axis=1)
@@ -331,19 +338,19 @@ def fit_track_segment(reco, planes, axis):
     return intercept, slope, clean
 
 
-def upstream_track(reco):
+def upstream_track(reco, x_align=None, y_align=None):
     """
     Fit straight-line tracks through MIMOSA planes 0–2 (upstream of target).
     Returns (x0, sx, y0, sy, mask) — intercepts and slopes in x and y, and
     the boolean mask of events where the fit succeeded on both axes.
     """
-    x0, sx, mx = fit_track_segment(reco, [0, 1, 2], "x")
-    y0, sy, my = fit_track_segment(reco, [0, 1, 2], "y")
+    x0, sx, mx = fit_track_segment(reco, [0, 1, 2], "x", x_align, y_align)
+    y0, sy, my = fit_track_segment(reco, [0, 1, 2], "y", x_align, y_align)
     mask = mx & my
     return x0, sx, y0, sy, mask
 
 
-def downstream_track(reco):
+def downstream_track(reco, x_align=None, y_align=None):
     """
     Fit straight-line tracks through MIMOSA planes 3–5 (downstream of target).
     Only available in 2020 physics files with the full 6-plane telescope.
@@ -352,8 +359,8 @@ def downstream_track(reco):
         n = reco.num_entries
         nan = np.full(n, np.nan)
         return nan, nan, nan, nan, np.zeros(n, dtype=bool)
-    x0, sx, mx = fit_track_segment(reco, [3, 4, 5], "x")
-    y0, sy, my = fit_track_segment(reco, [3, 4, 5], "y")
+    x0, sx, mx = fit_track_segment(reco, [3, 4, 5], "x", x_align, y_align)
+    y0, sy, my = fit_track_segment(reco, [3, 4, 5], "y", x_align, y_align)
     mask = mx & my
     return x0, sx, y0, sy, mask
 
@@ -363,14 +370,14 @@ def extrapolate(x0, slope, z_target):
     return x0 + slope * z_target
 
 
-def scattering_angles(reco):
+def scattering_angles(reco, x_align=None, y_align=None):
     """
     Compute the x- and y-scattering angles at the target for each event:
         θ_scatter = arctan(slope_downstream) - arctan(slope_upstream)
     Both in radians.  Returns (theta_x, theta_y, valid_mask).
     """
-    _, sx_up, _, sy_up, m_up = upstream_track(reco)
-    _, sx_dn, _, sy_dn, m_dn = downstream_track(reco)
+    _, sx_up, _, sy_up, m_up = upstream_track(reco, x_align, y_align)
+    _, sx_dn, _, sy_dn, m_dn = downstream_track(reco, x_align, y_align)
     valid = m_up & m_dn
     th_x = np.where(valid, np.arctan(sx_dn) - np.arctan(sx_up), np.nan)
     th_y = np.where(valid, np.arctan(sy_dn) - np.arctan(sy_up), np.nan)
@@ -607,13 +614,13 @@ def plot_mimosa_telescope(reco, mask_beam, mask_interaction, run_name, outdir):
     print(f"  Saved: {out}")
 
 
-def plot_scattering_angle(reco, mask_beam, run_name, outdir):
+def plot_scattering_angle(reco, mask_beam, run_name, outdir, x_align=None, y_align=None):
     """
     Scatter-angle distribution (x and y) from the 6-plane MIMOSA telescope.
     The angular trigger pre-selects events with θ > some minimum, so we
     expect a hole near zero.  The tails are inelastically scattered tracks.
     """
-    th_x, th_y, valid = scattering_angles(reco)
+    th_x, th_y, valid = scattering_angles(reco, x_align, y_align)
     mask = mask_beam & valid
     if mask.sum() < 10:
         print("  Skipping scattering-angle plot (too few events with both track segments)")
@@ -775,7 +782,7 @@ def plot_mm_pdo(raw, mask_beam, mask_interaction, run_name, outdir):
     print(f"  Saved: {out}")
 
 
-def plot_w_proper(reco, defl1, BL_Tm, E_beam_MeV, mask_beam, run_name, outdir):
+def plot_w_proper(reco, defl1, BL_Tm, E_beam_MeV, mask_beam, run_name, outdir, x_align=None, y_align=None):
     """
     Proper hadronic invariant mass W using both magnet and MIMOSA telescope:
 
@@ -801,7 +808,7 @@ def plot_w_proper(reco, defl1, BL_Tm, E_beam_MeV, mask_beam, run_name, outdir):
     E_e_MeV  = np.abs(p_GeV) * 1e3      # massless approximation fine at GeV scale
 
     # Scattering angle from MIMOSA telescope (upstream vs downstream segment)
-    th_x, th_y, valid_angle = scattering_angles(reco)
+    th_x, th_y, valid_angle = scattering_angles(reco, x_align, y_align)
     theta_e  = np.sqrt(th_x**2 + th_y**2)   # total angle [rad]
 
     # Event selection: beam-quality, valid angle, valid momentum, E_e' < E_beam
@@ -1002,13 +1009,17 @@ def main():
     n_sel = mask_sel.sum()
     print(f"Interaction candidates: {n_sel:,}  ({100*n_sel/n_beam:.2f}% of beam events)\n")
 
+    # ── Alignment correction from no-target run ───────────────────────────────
+    from mimosa_residuals import compute_alignment
+    align_x, align_y = compute_alignment("Runs/1601727557.root")
+
     # ── Upstream track fitting (MIMOSA 0–2) ──────────────────────────────────
-    x0_up, sx_up, y0_up, sy_up, m_up = upstream_track(reco)
+    x0_up, sx_up, y0_up, sy_up, m_up = upstream_track(reco, align_x, align_y)
     n_up_track = m_up.sum()
     print(f"Upstream tracks fitted  : {n_up_track:,}  ({100*n_up_track/n_total:.1f}%)")
 
     # ── Downstream track fitting (MIMOSA 3–5, if present) ────────────────────
-    _, sx_dn, _, sy_dn, m_dn = downstream_track(reco)
+    _, sx_dn, _, sy_dn, m_dn = downstream_track(reco, align_x, align_y)
     n_dn_track = m_dn.sum()
     if _has_downstream_mimosa(reco):
         print(f"Downstream tracks fitted: {n_dn_track:,}  ({100*n_dn_track/n_total:.1f}%)")
@@ -1036,7 +1047,7 @@ def main():
         print("  Skipping beam profile (no DWC in this run)")
 
     if _has_downstream_mimosa(reco):
-        plot_scattering_angle(reco, mask_beam, run_name, outdir)
+        plot_scattering_angle(reco, mask_beam, run_name, outdir, align_x, align_y)
 
     if not np.isnan(BL_Tm):
         plot_momentum_spectrum(defl1, defl2, mask_beam, mask_sel,
@@ -1048,7 +1059,7 @@ def main():
     else:
         print("  Skipping QDC/PDO plots (RAWdata not readable in this file)")
 
-    W_vals = plot_w_proper(reco, defl1, BL_Tm, E_beam_MeV, mask_beam, run_name, outdir)
+    W_vals = plot_w_proper(reco, defl1, BL_Tm, E_beam_MeV, mask_beam, run_name, outdir, align_x, align_y)
     if W_vals is not None and len(W_vals) > 30:
         plot_w_fit(W_vals, run_name, outdir)
 
