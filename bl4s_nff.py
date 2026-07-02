@@ -131,7 +131,7 @@ def _pad_hits(arr_ak, align_offset, max_hits):
     return dense - align_offset
 
 
-def _seed_fit_1d(z, hit_grids, anchor_idx):
+def _seed_fit_1d(z, hit_grids, anchor_idx, return_idx=False):
     """
     Vectorized seed-and-extend track finder for one coordinate (x or y) across a detector arm.
 
@@ -172,12 +172,14 @@ def _seed_fit_1d(z, hit_grids, anchor_idx):
         chosen = {a1: np.broadcast_to(ha1[:, :, None], slope.shape).copy(),
                   a2: np.broadcast_to(ha2[:, None, :], slope.shape).copy()}
 
+        best_k_all = {}                                             # per match plane, for idx
         for m in match_idx:
             pred = slope * z[m] + icept                              # (N, K1, K2)
             hits_m = hit_grids[m]                                    # (N, Km)
             diff = np.abs(pred[..., None] - hits_m[:, None, None, :])  # (N, K1, K2, Km)
             diff = np.where(np.isnan(diff), np.inf, diff)
             best_k = np.argmin(diff, axis=-1)                        # (N, K1, K2)
+            best_k_all[m] = best_k
             hits_m_b = np.broadcast_to(hits_m[:, None, None, :], diff.shape)
             chosen[m] = np.take_along_axis(hits_m_b, best_k[..., None], axis=-1)[..., 0]
 
@@ -198,11 +200,30 @@ def _seed_fit_1d(z, hit_grids, anchor_idx):
     for i in range(P):
         sel[i, finite] = chosen[i][ev, i_best, j_best][finite]
 
-    return sel
+    if not return_idx:
+        return sel
+
+    # chosen hit index per plane for the winning candidate (NaN where no valid candidate)
+    idx = np.full((P, n_events), np.nan)
+    idx[a1, finite] = i_best[finite]
+    idx[a2, finite] = j_best[finite]
+    for m in match_idx:
+        idx[m, finite] = best_k_all[m][ev, i_best, j_best][finite]
+    return sel, idx
+
+
+def _apply_exclude(grids, ex):
+    """NaN out, per plane, the hit indices in `ex` (P, N) — used to hide candidate-1's chosen
+    hits so a re-run of the same tracker finds the next-best (second-particle) track."""
+    for p, g in enumerate(grids):
+        m = np.isfinite(ex[p])
+        rows = np.where(m)[0]
+        cols = ex[p][m].astype(int)
+        g[rows, cols] = np.nan
 
 
 def upstream_track(reco, up_valid, align_x=None, align_y=None, rot_x=None, rot_y=None,
-                   cms_align=None, cms_rot=None):
+                   cms_align=None, cms_rot=None, exclude=None, return_idx=False, max_hits=None):
     """
     4-plane straight-line fit: M0(35.0) → CMS(36.9) → M1(38.6) → M2(41.4).
     Hit selection uses a seeding track finder (see _seed_fit_1d): the seed line is built from
@@ -244,12 +265,16 @@ def upstream_track(reco, up_valid, align_x=None, align_y=None, rot_x=None, rot_y
         reco["Mimosa2_yPosition"].array()[up_valid],
     ]
 
-    grids_x = [_pad_hits(r, a, MAX_HITS_PER_PLANE_UP) for r, a in zip(raw_x, ax)]
-    grids_y = [_pad_hits(r, a, MAX_HITS_PER_PLANE_UP) for r, a in zip(raw_y, ay)]
+    mh = MAX_HITS_PER_PLANE_UP if max_hits is None else max_hits
+    grids_x = [_pad_hits(r, a, mh) for r, a in zip(raw_x, ax)]
+    grids_y = [_pad_hits(r, a, mh) for r, a in zip(raw_y, ay)]
+    for ex in (exclude or []):        # exclude = list of (x_idx, y_idx) candidate hit-index pairs
+        _apply_exclude(grids_x, ex[0])
+        _apply_exclude(grids_y, ex[1])
 
     # Seed anchors: CMSPixel (index 1), Mimosa2 (index 3) -- longest lever arm from CMSPixel
-    x_sel = _seed_fit_1d(z_up, grids_x, anchor_idx=(1, 3))
-    y_sel = _seed_fit_1d(z_up, grids_y, anchor_idx=(1, 3))
+    x_sel, x_idx = _seed_fit_1d(z_up, grids_x, anchor_idx=(1, 3), return_idx=True)
+    y_sel, y_idx = _seed_fit_1d(z_up, grids_y, anchor_idx=(1, 3), return_idx=True)
 
     # Tilt corrections — track order [M0, CMS, M1, M2]; Mimosa rot indices [0, 1, 2]
     rx = np.zeros(4)
@@ -272,10 +297,12 @@ def upstream_track(reco, up_valid, align_x=None, align_y=None, rot_x=None, rot_y
     r_x = x_up - (b1_upx[np.newaxis, :] * z_up[:, np.newaxis] + b0_upx[np.newaxis, :])
     r_y = y_up - (b1_upy[np.newaxis, :] * z_up[:, np.newaxis] + b0_upy[np.newaxis, :])
     track_up = namedtuple("track_up", ["b1_upx", "b0_upx", "b1_upy", "b0_upy", "r_x", "r_y"])
-    return track_up(b1_upx, b0_upx, b1_upy, b0_upy, r_x, r_y)
+    trk = track_up(b1_upx, b0_upx, b1_upy, b0_upy, r_x, r_y)
+    return (trk, (x_idx, y_idx)) if return_idx else trk
 
 
-def downstream_track(reco, dn_valid, align_x=None, align_y=None, rot_x=None, rot_y=None):
+def downstream_track(reco, dn_valid, align_x=None, align_y=None, rot_x=None, rot_y=None,
+                     exclude=None, return_idx=False, max_hits=None):
     """
     3-plane straight-line fit: M3(48.5) → M4(51.5) → M5(53.65).
     Hit selection uses the same seeding track finder as upstream_track (see _seed_fit_1d):
@@ -308,12 +335,16 @@ def downstream_track(reco, dn_valid, align_x=None, align_y=None, rot_x=None, rot
         reco["Mimosa5_yPosition"].array()[dn_valid],
     ]
 
-    grids_x = [_pad_hits(r, a, MAX_HITS_PER_PLANE_DN) for r, a in zip(raw_x, ax)]
-    grids_y = [_pad_hits(r, a, MAX_HITS_PER_PLANE_DN) for r, a in zip(raw_y, ay)]
+    mh = MAX_HITS_PER_PLANE_DN if max_hits is None else max_hits
+    grids_x = [_pad_hits(r, a, mh) for r, a in zip(raw_x, ax)]
+    grids_y = [_pad_hits(r, a, mh) for r, a in zip(raw_y, ay)]
+    for ex in (exclude or []):        # exclude = list of (x_idx, y_idx) candidate hit-index pairs
+        _apply_exclude(grids_x, ex[0])
+        _apply_exclude(grids_y, ex[1])
 
     # Seed anchors: Mimosa3 (index 0), Mimosa5 (index 2) -- outermost pair
-    x_sel = _seed_fit_1d(z_dn, grids_x, anchor_idx=(0, 2))
-    y_sel = _seed_fit_1d(z_dn, grids_y, anchor_idx=(0, 2))
+    x_sel, x_idx = _seed_fit_1d(z_dn, grids_x, anchor_idx=(0, 2), return_idx=True)
+    y_sel, y_idx = _seed_fit_1d(z_dn, grids_y, anchor_idx=(0, 2), return_idx=True)
 
     rx = rot_x[3:] if rot_x is not None else np.zeros(3)
     ry = rot_y[3:] if rot_y is not None else np.zeros(3)
@@ -328,7 +359,8 @@ def downstream_track(reco, dn_valid, align_x=None, align_y=None, rot_x=None, rot
     r_x = x_dn - (b1_dnx[np.newaxis, :] * z_dn[:, np.newaxis] + b0_dnx[np.newaxis, :])
     r_y = y_dn - (b1_dny[np.newaxis, :] * z_dn[:, np.newaxis] + b0_dny[np.newaxis, :])
     track_dn = namedtuple("track_dn", ["b1_dnx", "b0_dnx", "b1_dny", "b0_dny", "r_x", "r_y"])
-    return track_dn(b1_dnx, b0_dnx, b1_dny, b0_dny, r_x, r_y)
+    trk = track_dn(b1_dnx, b0_dnx, b1_dny, b0_dny, r_x, r_y)
+    return (trk, (x_idx, y_idx)) if return_idx else trk
 
 
 def track_max_residual(r_x, r_y):

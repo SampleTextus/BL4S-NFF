@@ -1,1 +1,9 @@
-﻿node_modules/
+__pycache__/
+*.pyc
+node_modules/
+elog2020/
+
+# Large detector data — keep locally in Runs/, never commit (each file 30–180 MB)
+Runs/**/*.root
+
+# Comparison plots ARE committed (Runs/Plots/*.png); only the raw data is ignored above.
