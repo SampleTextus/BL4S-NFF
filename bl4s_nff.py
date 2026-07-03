@@ -7,6 +7,7 @@ from collections import namedtuple
 from scipy.optimize import minimize
 from scipy.integrate import quad
 from scipy.stats import chi2 as chi2_dist
+from scipy.stats import norm as norm_dist
 
 
 # Z positions in cm
@@ -447,6 +448,35 @@ def inv_mass_rec(track_up, track_dn, phi, up_valid, dn_valid, post_valid):
     return W[finite], theta[finite]
 
 
+_SIGNAL_PDF_CACHE = {}
+
+def signal_pdf(W_arr, sigma_res=None):
+    """
+    Signal line shape, normalised to unit integral over the fit window [W_LO, W_HI].
+    sigma_res=None: the bare Breit-Wigner (natural width only) -- valid only if the
+    detector W-resolution is negligible against Gamma. Otherwise the observed shape is
+    the BW convolved with a Gaussian of width sigma_res (a Voigt profile, up to the BW's
+    W-dependent numerator); sigma_w_propagation.py measures sigma_res ~ 295 MeV ~ 2.5*Gamma
+    from the no-target phi resolution, so the smeared template is the physical one.
+    """
+    if sigma_res is None:
+        return _bw_unnorm(W_arr) / _C_BW
+    # The convolution is cached on a dense grid per sigma_res and evaluated by
+    # interpolation, so repeated calls (e.g. from toy_mc_pvalue) cost almost nothing.
+    key = round(float(sigma_res), 6)
+    if key not in _SIGNAL_PDF_CACHE:
+        # True-W grid wide enough that everything that can smear into the window is included
+        Wp  = np.linspace(max(0.1, W_LO - 6 * sigma_res), W_HI + 6 * sigma_res, 1500)
+        bw  = _bw_unnorm(Wp)
+        wg  = np.linspace(W_LO, W_HI, 2000)
+        g   = np.exp(-0.5 * ((wg[:, None] - Wp[None, :]) / sigma_res)**2)
+        pdf = g @ bw * (Wp[1] - Wp[0]) / (np.sqrt(2 * np.pi) * sigma_res)
+        pdf /= np.trapezoid(pdf, wg)
+        _SIGNAL_PDF_CACHE[key] = (wg, pdf)
+    wg, pdf = _SIGNAL_PDF_CACHE[key]
+    return np.interp(np.asarray(W_arr, dtype=float), wg, pdf)
+
+
 def BW_distro(W, A):
     return A * W * mdelta * Gamma / ((W**2 - mdelta**2)**2 + (mdelta * Gamma)**2)
 
@@ -454,17 +484,19 @@ def BW_plus_bg(W, A, a0, a1):
     return BW_distro(W, A) + a0 + a1 * (W - mdelta)
 
 
-def unbinned_lrt(W):
+def unbinned_lrt(W, sigma_res=None):
     """
     Unbinned maximum likelihood ratio test: BW signal over a linear background.
     t = -2*log(L_null / L_alt) ~ chi2(1 dof) by Wilks' theorem.
+    sigma_res: detector W-resolution passed through to signal_pdf; None fits the bare
+    (unsmeared) Breit-Wigner template.
     Returns a dict with fit results and plot callables, or None if too few events.
     """
     W_fit = W[(W > W_LO) & (W < W_HI)]
     if len(W_fit) < 10:
         return None
 
-    bw_vals = _bw_unnorm(W_fit) / _C_BW
+    bw_vals = signal_pdf(W_fit, sigma_res)
 
     def nll_null(params):
         m, = params
@@ -497,15 +529,55 @@ def unbinned_lrt(W):
         return (1.0 + m_null * (W_arr - W_MID)) / _C_BG * N_fit * bin_w
 
     def total_curve(W_arr):
-        bw = _bw_unnorm(W_arr) / _C_BW
+        bw = signal_pdf(W_arr, sigma_res)
         bg = (1.0 + m_alt  * (W_arr - W_MID)) / _C_BG
         return (f_s * bw + (1.0 - f_s) * bg) * N_fit * bin_w
 
     return {
-        'f_s': f_s, 'm': m_alt, 't': t,
+        'f_s': f_s, 'm': m_alt, 'm_null': m_null, 't': t,
         'significance': np.sqrt(t),
         'bg_curve': bg_curve, 'total_curve': total_curve, 'N': N_fit,
     }
+
+
+def toy_mc_pvalue(W, sigma_res=None, n_toys=1000, seed=20260703):
+    """
+    Validate the asymptotic (Wilks) significance with background-only pseudo-experiments.
+    Wilks' chi2(1) approximation is shaky here for two reasons: the signal fraction sits on
+    the f_s >= 0 boundary, and (with sigma_res ~ 2.5*Gamma) the smeared signal template is
+    nearly degenerate with the linear background over the fit window. So instead: fit the
+    null (linear bg only) to the data, generate n_toys datasets of the same size from that
+    fitted null, push each through the IDENTICAL unbinned LRT, and count how often chance
+    alone produces t >= t_observed.
+    Returns dict with p (add-one-corrected), z (one-sided Gaussian equivalent), t_obs,
+    t_toys, and the Wilks p for comparison.
+    """
+    lrt = unbinned_lrt(W, sigma_res)
+    if lrt is None:
+        return None
+    t_obs, m, N = lrt['t'], lrt['m_null'], lrt['N']
+
+    rng = np.random.default_rng(seed)
+    pdf_max = (1.0 + abs(m) * max(W_HI - W_MID, W_MID - W_LO)) / _C_BG
+
+    def sample_null(n):
+        # rejection-sample n events from the fitted linear background pdf
+        out, need = [], n
+        while need > 0:
+            w = rng.uniform(W_LO, W_HI, 2 * need + 16)
+            u = rng.uniform(0.0, pdf_max, w.size)
+            acc = w[u < (1.0 + m * (w - W_MID)) / _C_BG][:need]
+            out.append(acc)
+            need -= len(acc)
+        return np.concatenate(out)
+
+    t_toys = np.array([unbinned_lrt(sample_null(N), sigma_res)['t']
+                       for _ in range(n_toys)])
+    p = (1 + np.sum(t_toys >= t_obs)) / (n_toys + 1)
+    z = norm_dist.ppf(1 - p)
+    p_wilks = 0.5 * (1 - chi2_dist.cdf(t_obs, 1)) if t_obs > 0 else 0.5
+    return {'t_obs': t_obs, 'p': p, 'z': z, 'p_wilks': p_wilks,
+            't_toys': t_toys, 'n_toys': n_toys}
 
 
 NOTARGET_PATH = "Runs/No Target Runs/1601728111.root"

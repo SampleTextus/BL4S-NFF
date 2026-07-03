@@ -117,15 +117,20 @@ def reconstruct(reco, valid, up, dn, matched, mm_align, phi_sigma_ref, phi_cente
     phi = phi[keep]
     pe = B.pelectron
     pe_new = B.momentum_track(phi)
-    theta = B.scatter_angle(up["b1x"][matched][post][keep], up["b1y"][matched][post][keep],
-                            dn["b1x"][matched][post][keep], dn["b1y"][matched][post][keep])
+    ux = up["b1x"][matched][post][keep]; uy = up["b1y"][matched][post][keep]
+    dx = dn["b1x"][matched][post][keep]; dy = dn["b1y"][matched][post][keep]
+    thx = np.arctan(dx) - np.arctan(ux)
+    thy = np.arctan(dy) - np.arctan(uy)
+    theta = np.sqrt(thx**2 + thy**2)
     with np.errstate(invalid="ignore"):
         W = np.sqrt((B.mproton + np.sqrt(B.melectron**2 + pe**2)
                      - np.sqrt(B.melectron**2 + pe_new**2))**2
                     - (pe**2 + pe_new**2 - 2 * pe * pe_new * np.cos(theta)))
-    W = W[np.isfinite(W)]
-    lrt = B.unbinned_lrt(W)
-    return (lrt['significance'] if lrt else float('nan')), phi_med, len(W)
+    fin = np.isfinite(W)
+    # per-event angles are returned alongside W (same finite mask) so downstream studies
+    # (sigma_W propagation, smeared-template fits) can run on the matcher selection
+    ang = {"phi": phi[fin], "thx": thx[fin], "thy": thy[fin], "theta": theta[fin]}
+    return W[fin], phi_med, ang
 
 
 def run_cap(reco, cap, max_cand, ax, ay, mm, rx, ry, ca, cr, pair_tol, sig_ref, phi_center):
@@ -134,8 +139,8 @@ def run_cap(reco, cap, max_cand, ax, ay, mm, rx, ry, ca, cr, pair_tol, sig_ref, 
     up_c = _extract(B.upstream_track, valid, (reco,), (ax, ay, rx, ry, ca, cr), max_cand, cap)
     dn_c = _extract(B.downstream_track, valid, (reco,), (ax, ay, rx, ry), max_cand, cap)
     up, dn, matched = match_multi(up_c, dn_c, pair_tol, N)
-    sig, _, nW = reconstruct(reco, valid, up, dn, matched, mm, sig_ref, phi_center=phi_center)
-    return N, int(matched.sum()), nW, sig
+    W, _, ang = reconstruct(reco, valid, up, dn, matched, mm, sig_ref, phi_center=phi_center)
+    return N, int(matched.sum()), W, ang
 
 
 def main():
@@ -156,7 +161,7 @@ def main():
     u0 = _extract(B.upstream_track, v0, (reco0,), (ax, ay, rx, ry, ca, cr), 1, 2)
     d0 = _extract(B.downstream_track, v0, (reco0,), (ax, ay, rx, ry), 1, 2)
     up0, dn0, m0 = match_multi(u0, d0, pair_tol, int(v0.sum()))
-    _, phi_center, _ = reconstruct(reco0, v0, up0, dn0, m0, mm, sig_ref)
+    _, phi_center, _ang0 = reconstruct(reco0, v0, up0, dn0, m0, mm, sig_ref)
     print(f"\npair_tol={pair_tol*1e4:.1f}um | sig_ref={sig_ref*1e3:.2f}mrad | "
           f"frozen phi center={phi_center*1e3:.2f}mrad")
     print("STEP 2 cap sweep (phi center frozen). Watch CONTROLS (0.5mm, H2O) -- must stay ~0:\n")
@@ -166,10 +171,12 @@ def main():
     for path, label, _cur in B.TARGET_RUNS:
         reco = B.open_tree(path)
         for cap, mc in configs:
-            N, nm, nW, sig = run_cap(reco, cap, mc, ax, ay, mm, rx, ry, ca, cr,
+            N, nm, W, _ang = run_cap(reco, cap, mc, ax, ay, mm, rx, ry, ca, cr,
                                      pair_tol, sig_ref, phi_center)
+            lrt = B.unbinned_lrt(W)
+            sig = lrt['significance'] if lrt else float('nan')
             tag = " <= baseline" if (cap, mc) == (2, 1) else ""
-            print(f"  {label:8s} {cap:>3d} {mc:>5d} {N:>8,} {nm:>8,} {nW:>7,} {sig:>6.2f}{tag}")
+            print(f"  {label:8s} {cap:>3d} {mc:>5d} {N:>8,} {nm:>8,} {len(W):>7,} {sig:>6.2f}{tag}")
         print()
 
 
